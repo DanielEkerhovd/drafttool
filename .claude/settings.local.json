@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create:*)",
+      "Bash(dir:*)",
+      "Bash(robocopy:*)",
+      "Bash(powershell -Command \"Move-Item -Path drafttool/* -Destination . -Force\")",
+      "Bash(rmdir:*)",
+      "Bash(npm install)",
+      "Bash(npm install:*)",
+      "Bash(npx tailwindcss init -p)",
+      "Bash(node_modules.bintailwindcss init -p)",
+      "Bash(./node_modules/.bin/tailwindcss init:*)",
+      "Bash(test:*)",
+      "Bash(cat:*)",
+      "Bash(npm run dev:*)",
+      "Bash(npm uninstall:*)"
+    ]
+  }
+}
