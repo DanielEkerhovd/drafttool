@@ -15,6 +15,10 @@ export interface Player {
   riotId: RiotID;
   puuid?: string;
   summonerId?: string;
+  summonerLevel?: number;
+  profileIconId?: number;
+  isLoading?: boolean;
+  error?: string;
 }
 
 export interface Team {
