@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Player, Region } from '../types';
 import TeamBuilder from '../components/TeamBuilder';
+import { useNavbar } from '../components/Navbar';
 import { useAuth } from '../hooks/useAuth';
 import { riotApi } from '../services/riotApi';
+import { championService } from '../services/championService';
 
 const ALL_REGIONS: Region[] = [
   'EUW1', 'EUN1', 'NA1', 'KR', 'BR1', 'JP1',
@@ -33,6 +35,34 @@ const formatRegionName = (region: Region): string => {
   return regionMap[region] || region;
 };
 
+interface ChampionData {
+  championId: number;
+  championName: string;
+  games: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  totalKills: number;
+  totalDeaths: number;
+  totalAssists: number;
+  avgKills: number;
+  avgDeaths: number;
+  avgAssists: number;
+  kda: number;
+  masteryPoints?: number;
+  masteryLevel?: number;
+}
+
+interface PlayerChampionAnalysis {
+  player: Player;
+  champions: ChampionData[];
+  isLoading: boolean;
+  error?: string;
+  totalMatchesCached?: number;
+  isLoadingMore?: boolean;
+  hasMoreMatches?: boolean;
+}
+
 export default function Dashboard() {
   const [ownStarters, setOwnStarters] = useState<Player[]>([]);
   const [ownSubs, setOwnSubs] = useState<Player[]>([]);
@@ -44,8 +74,15 @@ export default function Dashboard() {
   const [showRegionSelector, setShowRegionSelector] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [championAnalysis, setChampionAnalysis] = useState<PlayerChampionAnalysis[]>([]);
   const regionSelectorRef = useRef<HTMLDivElement>(null);
   const { signOut } = useAuth();
+  const { isCollapsed } = useNavbar();
+
+  // Load champion data from Data Dragon on mount
+  useEffect(() => {
+    championService.loadChampions();
+  }, []);
 
   // Close region selector when clicking outside
   useEffect(() => {
@@ -111,10 +148,13 @@ export default function Dashboard() {
       } else {
         setOwnStarters(prev => prev.map(p => p.id === player.id ? updatedPlayer : p));
       }
+
+      // Auto-fetch match history for this player
+      setTimeout(() => fetchMatchHistoryForPlayer(updatedPlayer), 500);
     } catch (error) {
       console.error(`Failed to fetch data for ${player.riotId.gameName}#${player.riotId.tagLine}:`, error);
 
-      // Update player with error
+      // Show error on player
       const playerWithError: Player = {
         ...player,
         isLoading: false,
@@ -132,6 +172,8 @@ export default function Dashboard() {
   const handleRemoveOwnPlayer = (playerId: string) => {
     setOwnStarters(ownStarters.filter(p => p.id !== playerId));
     setOwnSubs(ownSubs.filter(p => p.id !== playerId));
+    // Remove stats for this player
+    setChampionAnalysis(prev => prev.filter(a => a.player.id !== playerId));
   };
 
   const handleReorderOwnPlayers = (starters: Player[], subs: Player[]) => {
@@ -186,6 +228,9 @@ export default function Dashboard() {
       } else {
         setEnemyStarters(prev => prev.map(p => p.id === player.id ? updatedPlayer : p));
       }
+
+      // Auto-fetch match history for this player
+      setTimeout(() => fetchMatchHistoryForPlayer(updatedPlayer), 500);
     } catch (error) {
       console.error(`Failed to fetch data for ${player.riotId.gameName}#${player.riotId.tagLine}:`, error);
 
@@ -207,6 +252,8 @@ export default function Dashboard() {
   const handleRemoveEnemyPlayer = (playerId: string) => {
     setEnemyStarters(enemyStarters.filter(p => p.id !== playerId));
     setEnemySubs(enemySubs.filter(p => p.id !== playerId));
+    // Remove stats for this player
+    setChampionAnalysis(prev => prev.filter(a => a.player.id !== playerId));
   };
 
   const handleReorderEnemyPlayers = (starters: Player[], subs: Player[]) => {
@@ -335,6 +382,9 @@ export default function Dashboard() {
       setEnemySubs(updatePlayers(enemySubs));
 
       console.log('Analysis complete!', results);
+
+      // Now fetch match history for all players with PUUIDs
+      await fetchMatchHistory();
     } catch (error) {
       console.error('Failed to analyze teams:', error);
     } finally {
@@ -342,25 +392,265 @@ export default function Dashboard() {
     }
   };
 
-  return (
-    <div className="min-h-screen bg-gray-900 text-white p-8">
-      {/* Error Toast */}
-      {errorMessage && (
-        <div className="fixed top-4 right-4 z-50 animate-slide-in">
-          <div className="bg-red-600 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3">
-            <span className="text-xl">⚠</span>
-            <span>{errorMessage}</span>
-            <button
-              onClick={() => setErrorMessage(null)}
-              className="ml-2 text-white hover:text-gray-200"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
+  const fetchMatchHistoryForPlayer = async (player: Player) => {
+    if (!player.puuid) return;
 
-      <div className="max-w-7xl mx-auto">
+    // Check if this player is already in the analysis
+    const existingIndex = championAnalysis.findIndex(a => a.player.id === player.id);
+
+    if (existingIndex >= 0) {
+      // Update existing entry to loading
+      setChampionAnalysis(prev => prev.map((a, idx) =>
+        idx === existingIndex ? { ...a, isLoading: true, champions: [] } : a
+      ));
+    } else {
+      // Add new entry with loading state
+      setChampionAnalysis(prev => [...prev, {
+        player,
+        champions: [],
+        isLoading: true,
+      }]);
+    }
+
+    try {
+      // Season 2025 started January 8, 2025
+      const seasonStart = new Date('2025-01-08').getTime();
+
+      // Fetch ranked solo/duo matches with cache-first strategy
+      await riotApi.fetchMatchesWithCache(
+        player.puuid!,
+        player.riotId.region,
+        (matches, masteryData, isFromCache) => {
+          // Update with current progress
+          const championStats = riotApi.analyzeChampionStats(matches, player.puuid!, masteryData);
+
+          setChampionAnalysis(prev => {
+            const currentIndex = prev.findIndex(a => a.player.id === player.id);
+            if (currentIndex >= 0) {
+              return prev.map((a, idx) =>
+                idx === currentIndex ? {
+                  ...a,
+                  champions: championStats,
+                  isLoading: !isFromCache, // If from cache, show as complete; otherwise still loading
+                  totalMatchesCached: matches.length,
+                  hasMoreMatches: matches.length >= 33, // Assume more matches if we got full count
+                } : a
+              );
+            }
+            return prev;
+          });
+        },
+        33, // Fetch up to 33 games (199 total / 6 players)
+        {
+          queue: 420, // Ranked Solo/Duo only
+          startTime: seasonStart
+        }
+      );
+
+      // Mark as complete (in case final update didn't happen)
+      setChampionAnalysis(prev => prev.map(a =>
+        a.player.id === player.id ? { ...a, isLoading: false, hasMoreMatches: a.totalMatchesCached ? a.totalMatchesCached >= 33 : false } : a
+      ));
+    } catch (error) {
+      console.error(`Failed to fetch matches for ${player.riotId.gameName}#${player.riotId.tagLine}:`, error);
+
+      // Check if we already have cached data from the progress callback
+      const existingAnalysis = championAnalysis.find(a => a.player.id === player.id);
+
+      // If we have cached data, don't show error - just mark as complete
+      if (existingAnalysis && existingAnalysis.champions.length > 0) {
+        console.log(`[Dashboard] Using cached data for ${player.riotId.gameName}, ignoring API error`);
+        setChampionAnalysis(prev => prev.map(a =>
+          a.player.id === player.id ? { ...a, isLoading: false } : a
+        ));
+        return; // Don't show error if we have cached data
+      }
+
+      // No cached data available, show error message
+      let errorMessage = 'Failed to fetch match history';
+      if (error instanceof Error) {
+        if (error.message === 'API_RATE_LIMIT' || error.message.includes('429')) {
+          errorMessage = 'API is overloaded. Please wait 2 minutes and try again.';
+        } else if (error.message === 'API_UNAVAILABLE') {
+          errorMessage = 'Riot API is temporarily unavailable. Try again later.';
+        } else if (error.message === 'API_SERVER_ERROR') {
+          errorMessage = 'Riot servers are experiencing issues. Please try again later.';
+        } else {
+          errorMessage = error.message;
+        }
+      }
+
+      const errorAnalysis = {
+        player,
+        champions: [],
+        isLoading: false,
+        error: errorMessage,
+      };
+
+      setChampionAnalysis(prev => {
+        const currentIndex = prev.findIndex(a => a.player.id === player.id);
+        if (currentIndex >= 0) {
+          return prev.map((a, idx) => idx === currentIndex ? errorAnalysis : a);
+        }
+        return [...prev.filter(a => a.player.id !== player.id), errorAnalysis];
+      });
+    }
+  };
+
+  const handleLoadMore = async (player: Player) => {
+    if (!player.puuid) return;
+
+    const analysis = championAnalysis.find(a => a.player.id === player.id);
+    if (!analysis) return;
+
+    // Set loading state
+    setChampionAnalysis(prev => prev.map(a =>
+      a.player.id === player.id ? { ...a, isLoadingMore: true } : a
+    ));
+
+    try {
+      const seasonStart = new Date('2025-01-08').getTime();
+
+      const result = await riotApi.loadMoreMatches(
+        player.puuid!,
+        player.riotId.region,
+        33, // Load 33 more matches
+        {
+          queue: 420,
+          startTime: seasonStart
+        }
+      );
+
+      // Update with all matches
+      const championStats = riotApi.analyzeChampionStats(result.matches, player.puuid!, result.masteryData);
+
+      setChampionAnalysis(prev => prev.map(a =>
+        a.player.id === player.id ? {
+          ...a,
+          champions: championStats,
+          totalMatchesCached: result.matches.length,
+          hasMoreMatches: result.hasMore,
+          isLoadingMore: false,
+        } : a
+      ));
+    } catch (error) {
+      console.error(`Failed to load more matches for ${player.riotId.gameName}#${player.riotId.tagLine}:`, error);
+
+      // Provide user-friendly error messages
+      let errorMessage = 'Failed to load more matches';
+      if (error instanceof Error) {
+        if (error.message === 'API_RATE_LIMIT' || error.message.includes('429')) {
+          errorMessage = 'API is overloaded. Please wait 2 minutes and try again.';
+        } else if (error.message === 'API_UNAVAILABLE') {
+          errorMessage = 'Riot API is temporarily unavailable. Try again later.';
+        } else if (error.message === 'API_SERVER_ERROR') {
+          errorMessage = 'Riot servers are experiencing issues. Please try again later.';
+        } else {
+          errorMessage = error.message;
+        }
+      }
+
+      setChampionAnalysis(prev => prev.map(a =>
+        a.player.id === player.id ? {
+          ...a,
+          isLoadingMore: false,
+          error: errorMessage,
+        } : a
+      ));
+    }
+  };
+
+  const fetchMatchHistory = async () => {
+    const allPlayers = [...ownStarters, ...ownSubs, ...enemyStarters, ...enemySubs];
+    const playersWithData = allPlayers.filter(p => p.puuid);
+
+    if (playersWithData.length === 0) {
+      return;
+    }
+
+    // Set loading state for all players
+    setChampionAnalysis(
+      playersWithData.map(player => ({
+        player,
+        champions: [],
+        isLoading: true,
+      }))
+    );
+
+    // Season 2025 started January 8, 2025
+    const seasonStart = new Date('2025-01-08').getTime();
+
+    // Fetch matches for each player in parallel
+    const analysisPromises = playersWithData.map(async (player) => {
+      try {
+        // Fetch ranked matches and mastery data in parallel
+        const [matches, masteryData] = await Promise.all([
+          riotApi.fetchPlayerMatches(
+            player.puuid!,
+            player.riotId.region,
+            60, // Fetch up to 60 games
+            {
+              queue: 420, // Ranked Solo/Duo only
+              startTime: seasonStart
+            }
+          ),
+          riotApi.getChampionMastery(player.puuid!, player.riotId.region)
+        ]);
+
+        const championStats = riotApi.analyzeChampionStats(matches, player.puuid!, masteryData);
+
+        return {
+          player,
+          champions: championStats,
+          isLoading: false,
+        };
+      } catch (error) {
+        console.error(`Failed to fetch matches for ${player.riotId.gameName}#${player.riotId.tagLine}:`, error);
+        return {
+          player,
+          champions: [],
+          isLoading: false,
+          error: error instanceof Error ? error.message : 'Failed to fetch match history',
+        };
+      }
+    });
+
+    const analysis = await Promise.all(analysisPromises);
+    setChampionAnalysis(analysis);
+  };
+
+  // Sort championAnalysis to match player order
+  const sortedChampionAnalysis = useMemo(() => {
+    // Create ordered list of all players
+    const allPlayers = [...ownStarters, ...ownSubs, ...enemyStarters, ...enemySubs];
+
+    // Sort championAnalysis based on player order
+    return allPlayers
+      .map(player => championAnalysis.find(a => a.player.id === player.id))
+      .filter((analysis): analysis is PlayerChampionAnalysis => analysis !== undefined);
+  }, [ownStarters, ownSubs, enemyStarters, enemySubs, championAnalysis]);
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white">
+      {/* Main Content */}
+      <div className={`transition-all duration-300 p-8 ${isCollapsed ? 'ml-20' : 'ml-64'}`}>
+        {/* Error Toast */}
+        {errorMessage && (
+          <div className="fixed top-4 right-4 z-50 animate-slide-in">
+            <div className="bg-red-600 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3">
+              <span className="text-xl">⚠</span>
+              <span>{errorMessage}</span>
+              <button
+                onClick={() => setErrorMessage(null)}
+                className="ml-2 text-white hover:text-gray-200"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="max-w-7xl mx-auto">
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-4xl font-bold">Team Analysis Dashboard</h1>
           <div className="flex items-center gap-4">
@@ -500,6 +790,147 @@ export default function Dashboard() {
             </button>
           </div>
         )}
+
+        {/* Champion Analysis Section - TEMPORARY VISUAL SHOWCASE */}
+        {sortedChampionAnalysis.length > 0 && (
+          <div className="bg-gray-800 rounded-lg p-6 mt-8">
+            <h2 className="text-2xl font-semibold mb-4">Champion Pool Analysis (Ranked Solo/Duo - Season 2025)</h2>
+            <p className="text-gray-400 text-sm mb-6">Showing up to 60 ranked games from this season, sorted by games → win rate → mastery</p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {sortedChampionAnalysis.map((analysis) => (
+                <div key={analysis.player.id} className="bg-gray-700/50 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-3 pb-3 border-b border-gray-600">
+                    <div>
+                      <h3 className="text-lg font-semibold text-blue-400">
+                        {analysis.player.riotId.gameName}#{analysis.player.riotId.tagLine}
+                      </h3>
+                      <p className="text-xs text-gray-400">Level {analysis.player.summonerLevel || '?'}</p>
+                    </div>
+
+                    {/* Loading/Load More Section */}
+                    <div className="flex items-center gap-3">
+                      {/* Initial Loading Spinner */}
+                      {analysis.isLoading && (
+                        <div className="flex items-center gap-2">
+                          {analysis.champions.length > 0 && (
+                            <span className="text-xs text-gray-400">Loading...</span>
+                          )}
+                          <svg className="animate-spin h-5 w-5 text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                          </svg>
+                        </div>
+                      )}
+
+                      {/* Load More Button (when not initially loading) */}
+                      {!analysis.isLoading && analysis.champions.length > 0 && (
+                        <>
+                          {analysis.isLoadingMore ? (
+                            <div className="flex items-center gap-2 text-blue-400">
+                              <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                              <span className="text-xs">Loading more...</span>
+                            </div>
+                          ) : analysis.hasMoreMatches ? (
+                            <div className="flex flex-col items-end gap-0.5">
+                              <button
+                                onClick={() => handleLoadMore(analysis.player)}
+                                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded transition-colors"
+                              >
+                                Load More
+                              </button>
+                              <span className="text-[10px] text-gray-400 opacity-60">
+                                ({analysis.totalMatchesCached || 0} games analyzed)
+                              </span>
+                            </div>
+                          ) : analysis.totalMatchesCached && analysis.totalMatchesCached > 0 ? (
+                            <div className="flex flex-col items-end gap-0.5">
+                              <div className="text-gray-400 text-xs">
+                                ✓ Up to date
+                              </div>
+                              <span className="text-[10px] text-gray-500 opacity-60">
+                                ({analysis.totalMatchesCached} games analyzed)
+                              </span>
+                            </div>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {analysis.error && (
+                    <div className="text-red-400 text-sm py-2">{analysis.error}</div>
+                  )}
+
+                  {!analysis.isLoading && !analysis.error && analysis.champions.length === 0 && (
+                    <div className="text-gray-400 text-sm py-2">No recent matches found</div>
+                  )}
+
+                  {analysis.champions.length > 0 && (
+                    <div className="space-y-2">
+                      {analysis.champions.slice(0, 10).map((champ, idx) => (
+                        <div key={champ.championId} className="flex items-center justify-between bg-gray-800/50 rounded p-3">
+                          <div className="flex items-center gap-3 flex-1">
+                            <div className="text-gray-500 font-semibold text-sm w-4">#{idx + 1}</div>
+
+                            {/* Champion Icon */}
+                            <img
+                              src={championService.getChampionIconUrl(champ.championId)}
+                              alt={championService.getChampionName(champ.championId)}
+                              className="w-10 h-10 rounded-full border-2 border-gray-700"
+                              onError={(e) => {
+                                // Fallback if image fails to load
+                                e.currentTarget.style.display = 'none';
+                              }}
+                            />
+
+                            <div className="flex-1">
+                              <div className="flex items-center gap-2">
+                                <div className="font-semibold text-white">{championService.getChampionName(champ.championId)}</div>
+                                {champ.masteryLevel && champ.masteryLevel >= 4 && (
+                                  <div className={`text-xs px-1.5 py-0.5 rounded font-bold ${
+                                    champ.masteryLevel === 7 ? 'bg-purple-600/30 text-purple-300' :
+                                    champ.masteryLevel === 6 ? 'bg-blue-600/30 text-blue-300' :
+                                    champ.masteryLevel === 5 ? 'bg-red-600/30 text-red-300' :
+                                    'bg-gray-600/30 text-gray-300'
+                                  }`}>
+                                    M{champ.masteryLevel}
+                                  </div>
+                                )}
+                              </div>
+                              <div className="text-xs text-gray-400">
+                                {champ.games} {champ.games === 1 ? 'game' : 'games'} • {champ.wins}W {champ.losses}L
+                                {champ.kda !== undefined && (
+                                  <> • <span className="text-sm font-semibold text-white">{champ.kda.toFixed(2)}</span> <span className="text-[10px] opacity-60">({champ.avgKills.toFixed(1)}/{champ.avgDeaths?.toFixed(1)}/{champ.avgAssists?.toFixed(1)})</span></>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <div className={`text-lg font-bold ${
+                            champ.winRate >= 60 ? 'text-green-400' :
+                            champ.winRate >= 50 ? 'text-yellow-400' :
+                            'text-red-400'
+                          }`}>
+                            {champ.winRate}%
+                          </div>
+                        </div>
+                      ))}
+                      {analysis.champions.length > 10 && (
+                        <div className="text-center text-gray-500 text-sm pt-2">
+                          +{analysis.champions.length - 10} more champions
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        </div>
       </div>
     </div>
   );

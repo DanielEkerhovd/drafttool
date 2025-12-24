@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './hooks/useAuth';
+import { NavbarProvider } from './components/Navbar';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 
@@ -16,17 +17,19 @@ function App() {
 
   return (
     <BrowserRouter>
-      <Routes>
-        <Route
-          path="/login"
-          element={user ? <Navigate to="/dashboard" /> : <Login />}
-        />
-        <Route
-          path="/dashboard"
-          element={user ? <Dashboard /> : <Navigate to="/login" />}
-        />
-        <Route path="/" element={<Navigate to="/dashboard" />} />
-      </Routes>
+      <NavbarProvider>
+        <Routes>
+          <Route
+            path="/login"
+            element={user ? <Navigate to="/dashboard" /> : <Login />}
+          />
+          <Route
+            path="/dashboard"
+            element={user ? <Dashboard /> : <Navigate to="/login" />}
+          />
+          <Route path="/" element={<Navigate to="/dashboard" />} />
+        </Routes>
+      </NavbarProvider>
     </BrowserRouter>
   );
 }

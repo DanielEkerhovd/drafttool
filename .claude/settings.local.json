@@ -14,7 +14,9 @@
       "Bash(test:*)",
       "Bash(cat:*)",
       "Bash(npm run dev:*)",
-      "Bash(npm uninstall:*)"
+      "Bash(npm uninstall:*)",
+      "Bash(curl:*)",
+      "Bash(where:*)"
     ]
   }
 }
